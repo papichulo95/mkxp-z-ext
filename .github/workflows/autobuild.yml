@@ -15,135 +15,10 @@ permissions:
   contents: read
 
 env:
+  # Sube este número para invalidar a mano las cachés de dependencias.
   CACHE_VERSION: v1
 
 jobs:
-  build-windows:
-    name: Windows x86_64
-    runs-on: windows-latest
-    timeout-minutes: 120
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-
-      - name: Compute artifact name
-        id: meta
-        shell: bash
-        run: |
-          ref="$(printf '%s' "$GITHUB_REF_NAME" | tr -c 'A-Za-z0-9._-' '-')"
-          echo "name=mkxp-z.windows.x86_64.${ref}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-
-      - uses: msys2/setup-msys2@v2
-        with:
-          msystem: mingw64
-          install: >-
-            base-devel
-            git
-            ruby
-            vim
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-meson
-            mingw-w64-x86_64-autotools
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-ccache
-
-      - name: Restore dependency cache
-        id: deps-cache
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            windows/build-mingw64
-            windows/downloads
-          key: win-deps-${{ env.CACHE_VERSION }}-${{ hashFiles('windows/Makefile') }}
-
-      - name: Build all dependencies
-        shell: msys2 {0}
-        run: |
-          cd windows
-          make
-
-      - name: Save dependency cache
-        if: steps.deps-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            windows/build-mingw64
-            windows/downloads
-          key: ${{ steps.deps-cache.outputs.cache-primary-key }}
-
-      - name: Restore ccache
-        uses: actions/cache@v4
-        with:
-          path: .ccache
-          key: ccache-win-${{ github.sha }}
-          restore-keys: ccache-win-
-
-      - name: Build exe
-        shell: msys2 {0}
-        env:
-          CC: ccache gcc
-          CXX: ccache g++
-          CCACHE_DIR: ${{ github.workspace }}/.ccache
-          CCACHE_MAXSIZE: 300M
-          CCACHE_COMPRESS: "1"
-        run: |
-          source windows/vars.sh
-          meson setup build
-          cd build
-          ninja
-          strip ./mkxp-z.exe
-          ccache -s || true
-
-      - name: Prepare archive
-        shell: msys2 {0}
-        run: |
-          mkdir build/artifact
-          cd build/artifact
-          cp /mingw64/bin/zlib1.dll .
-          cp ../../windows/build-mingw64/bin/x64-msvcrt-ruby310.dll .
-          cp -r ../../windows/build-mingw64/lib/ruby/3.1.0 .
-          mv ./3.1.0 ./stdlib
-          cp ../mkxp-z.exe .
-          cp ../../mkxp.json .
-          cp -r ../../scripts .
-          cp ../../assets/LICENSE.mkxp-z-with-https.txt .
-
-      - name: Check for DLLs missing from the artifact
-        shell: msys2 {0}
-        run: |
-          cd build/artifact
-          error_flag=
-
-          for file in *.exe *.dll
-          do
-            ldd_output="$(ldd "$file")"
-            echo "$file"
-            echo "$ldd_output"
-
-            while IFS= read -r line
-            do
-              dll_name="$(echo "$line" | sed -e 's/=>/|/g' | cut -d '|' -f 1 | sed -e 's/^[ \t]*//g' -e 's/[ \t]*$//g')"
-              dll_location="$(echo "$line" | sed -e 's/=>/|/g' | cut -d '|' -f 2 | sed -e 's/^[ \t]*//g' -e 's/[ \t]*$//g')"
-              if [[ "$dll_location" = 'not found'* ]] || [[ "$dll_location" = '/mingw64/bin/'* ]] || [[ "$dll_location" = '/mingw64/lib/'* ]] || [[ "$dll_location" = '/mingw64/usr/bin/'* ]] || [[ "$dll_location" = '/mingw64/usr/lib/'* ]]
-              then
-                error_flag=1
-                echo "::error::$dll_name is missing from the artifact"
-              fi
-            done <<< "$ldd_output"
-          done
-
-          if [ -n "$error_flag" ]
-          then
-            exit 1
-          fi
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.meta.outputs.name }}
-          path: build/artifact
-          retention-days: 14
-          if-no-files-found: error
-
   build-linux:
     name: ${{ matrix.os }} x86_64
     runs-on: ${{ matrix.os }}
@@ -153,10 +28,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # GitHub retira este runner el 17-abr-2027; cuando pase, cambia a 24.04.
           - os: ubuntu-22.04
             experimental: false
-          - os: ubuntu-24.04
-            experimental: true
+          # Descomenta para probar también en 24.04 (su binario NO corre en Mint 21):
+          # - os: ubuntu-24.04
+          #   experimental: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -181,10 +58,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y git wget build-essential cmake meson autoconf automake libtool pkg-config ruby bison xxd zlib1g-dev libbz2-dev xorg-dev libgl1-mesa-dev libasound2-dev libpulse-dev ccache
 
+      # ftp.gnu.org suele expirar desde los runners de GitHub (libiconv).
+      # ftpmirror.gnu.org redirige a un espejo cercano, y ~/.wgetrc añade
+      # reintentos y timeouts a cualquier wget que lance el Makefile.
+      - name: Make downloads more reliable
+        run: |
+          sed -i 's|https://ftp.gnu.org/pub/gnu/|https://ftpmirror.gnu.org/|g' linux/Makefile
+          printf '%s\n' 'tries = 5' 'connect_timeout = 20' 'read_timeout = 60' 'waitretry = 10' 'retry_connrefused = on' > ~/.wgetrc
+
+      # El Makefile usa archivos como objetivos: al reintentar retoma donde se quedó.
       - name: Build all dependencies
         run: |
           cd linux
-          make
+          for attempt in 1 2 3; do
+            make && exit 0
+            echo "::warning::make falló (intento $attempt/3); reintentando"
+            rm -f downloads/x86_64/libiconv-*.tar.gz*
+            sleep 20
+          done
+          exit 1
 
       - name: Save dependency cache
         if: steps.deps-cache.outputs.cache-hit != 'true'
@@ -226,7 +118,7 @@ jobs:
           cp -r ../../scripts .
           cp ../../assets/LICENSE.mkxp-z-with-https.txt .
 
-
+      # tar conserva el bit de ejecución; el zip de upload-artifact no.
       - name: Pack tarball
         run: tar -czf "${{ steps.meta.outputs.name }}.tar.gz" -C build/local .
 
