@@ -1,5 +1,7 @@
 
+
 name: Build-test
+
 
 on:
   push:
@@ -15,7 +17,7 @@ permissions:
   contents: read
 
 env:
-  # Sube este número para invalidar a mano las cachés de dependencias.
+
   CACHE_VERSION: v1
 
 jobs:
@@ -28,12 +30,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # GitHub retira este runner el 17-abr-2027; cuando pase, cambia a 24.04.
+
           - os: ubuntu-22.04
             experimental: false
-          # Descomenta para probar también en 24.04 (su binario NO corre en Mint 21):
-          # - os: ubuntu-24.04
-          #   experimental: true
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -58,22 +58,45 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y git wget build-essential cmake meson autoconf automake libtool pkg-config ruby bison xxd zlib1g-dev libbz2-dev xorg-dev libgl1-mesa-dev libasound2-dev libpulse-dev ccache
 
-      # ftp.gnu.org suele expirar desde los runners de GitHub (libiconv).
-      # ftpmirror.gnu.org redirige a un espejo cercano, y ~/.wgetrc añade
-      # reintentos y timeouts a cualquier wget que lance el Makefile.
-      - name: Make downloads more reliable
+   
+      - name: Prefetch libiconv and add wget retries
         run: |
-          sed -i 's|https://ftp.gnu.org/pub/gnu/|https://ftpmirror.gnu.org/|g' linux/Makefile
           printf '%s\n' 'tries = 5' 'connect_timeout = 20' 'read_timeout = 60' 'waitretry = 10' 'retry_connrefused = on' > ~/.wgetrc
+          mkdir -p linux/downloads/x86_64
+          f=linux/downloads/x86_64/libiconv-1.18.tar.gz
+          if [ ! -s "$f" ]; then
+            ok=
+            for url in \
+              https://mirrors.kernel.org/gnu/libiconv/libiconv-1.18.tar.gz \
+              https://ftp.fau.de/gnu/libiconv/libiconv-1.18.tar.gz \
+              https://mirrors.dotsrc.org/gnu/libiconv/libiconv-1.18.tar.gz \
+              https://mirrors.ocf.berkeley.edu/gnu/libiconv/libiconv-1.18.tar.gz \
+              https://mirror.csclub.uwaterloo.ca/gnu/libiconv/libiconv-1.18.tar.gz \
+              https://ftp.gnu.org/pub/gnu/libiconv/libiconv-1.18.tar.gz
+            do
+              echo "Probando $url"
+              if wget -q --tries=2 --timeout=20 -O "$f.part" "$url" && tar -tzf "$f.part" >/dev/null 2>&1; then
+                mv "$f.part" "$f"
+                ok=1
+                break
+              fi
+              rm -f "$f.part"
+            done
+            if [ -z "$ok" ]; then
+              echo "::error::No se pudo descargar libiconv-1.18 de ningún espejo"
+              exit 1
+            fi
+          fi
+          ls -l "$f"
 
-      # El Makefile usa archivos como objetivos: al reintentar retoma donde se quedó.
+    
       - name: Build all dependencies
         run: |
           cd linux
           for attempt in 1 2 3; do
             make && exit 0
+            [ "$attempt" -lt 3 ] || break
             echo "::warning::make falló (intento $attempt/3); reintentando"
-            rm -f downloads/x86_64/libiconv-*.tar.gz*
             sleep 20
           done
           exit 1
@@ -118,7 +141,7 @@ jobs:
           cp -r ../../scripts .
           cp ../../assets/LICENSE.mkxp-z-with-https.txt .
 
-      # tar conserva el bit de ejecución; el zip de upload-artifact no.
+
       - name: Pack tarball
         run: tar -czf "${{ steps.meta.outputs.name }}.tar.gz" -C build/local .
 
